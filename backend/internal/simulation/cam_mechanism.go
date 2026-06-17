@@ -8,23 +8,65 @@ import (
 
 // CamMechanism 凸轮机构
 // 采用等径凸轮（Conjugate Cam）设计，确保正反行程均有精确控制
+// 引入缓冲弹簧模型，消除高速运动时的冲击，防止机构卡死
 type CamMechanism struct {
 	Params          CamParams
+	BufferSpring    BufferSpringParams
 	ProfilePoints   []CamProfilePoint
 	CurrentAngle    float64       // 当前凸轮转角 φ [rad]
 	CurrentFollower CamFollowerState
+	FollowerMass    float64       // 从动件等效质量 [kg]
+	ExternalLoad    float64       // 外载荷 F_load [N]
 }
 
 // NewCamMechanism 创建凸轮机构
-func NewCamMechanism(params CamParams) *CamMechanism {
+func NewCamMechanism(params CamParams, springParams BufferSpringParams) *CamMechanism {
 	return &CamMechanism{
-		Params: params,
+		Params:       params,
+		BufferSpring: springParams,
+		FollowerMass: 0.5, // 默认等效质量 0.5kg
 	}
 }
 
+// DefaultBufferSpringParams 默认缓冲弹簧参数
+func DefaultBufferSpringParams() BufferSpringParams {
+	return BufferSpringParams{
+		Stiffness:      5000.0,  // 5000 N/m
+		Preload:        50.0,    // 50 N 预紧力
+		Damping:        30.0,    // 30 N·s/m
+		MaxCompression: 0.02,    // 20 mm 最大压缩量
+		EquivalentMass: 0.5,     // 0.5 kg
+	}
+}
+
+// quinticPoly 5次多项式计算
+// 用于缓冲段，保证位移、速度、加速度、跃度连续
+// s(T) = c0 + c1*T + c2*T² + c3*T³ + c4*T⁴ + c5*T⁵
+// 边界条件: s(0)=s0, s'(0)=v0, s''(0)=a0, s(1)=s1, s'(1)=v1, s''(1)=a1
+func quinticPoly(T float64, s0, v0, a0, s1, v1, a1 float64) (s, v, a, j float64) {
+	T2 := T * T
+	T3 := T2 * T
+	T4 := T3 * T
+	T5 := T4 * T
+
+	c0 := s0
+	c1 := v0
+	c2 := a0 / 2.0
+	c3 := 10.0*(s1-s0) - 6.0*v0 - 4.0*v1 - 1.5*a0 + 0.5*a1
+	c4 := -15.0*(s1-s0) + 8.0*v0 + 7.0*v1 + 2.0*a0 - a1
+	c5 := 6.0*(s1-s0) - 3.0*(v0+v1) - 0.5*(a0-a1)
+
+	s = c0 + c1*T + c2*T2 + c3*T3 + c4*T4 + c5*T5
+	v = c1 + 2.0*c2*T + 3.0*c3*T2 + 4.0*c4*T3 + 5.0*c5*T4
+	a = 2.0*c2 + 6.0*c3*T + 12.0*c4*T2 + 20.0*c5*T3
+	j = 6.0*c3 + 24.0*c4*T + 60.0*c5*T2
+
+	return
+}
+
 // GenerateProfile 生成凸轮轮廓曲线
-// 等径凸轮（也叫对心凸轮）的轮廓曲线满足：r(φ) + r(φ + π) = 常数
-// 采用正弦加速度运动规律（简谐运动）实现平滑的从动件运动
+// 采用带缓冲段的改进正弦加速度运动规律
+// 段划分: 缓冲推程 → 主推程 → 缓冲推程 → 远休止 → 缓冲回程 → 主回程 → 缓冲回程 → 近休止
 func (cm *CamMechanism) GenerateProfile(numPoints int) []CamProfilePoint {
 	cm.ProfilePoints = make([]CamProfilePoint, numPoints)
 	dφ := 2 * math.Pi / float64(numPoints)
@@ -42,19 +84,28 @@ func (cm *CamMechanism) GenerateProfile(numPoints int) []CamProfilePoint {
 // 输入: 凸轮转角 φ [rad]
 // 输出: 轮廓点坐标、法向量、曲率
 //
-// 等径凸轮轮廓计算:
-// 基圆半径: Rb, 升程: h
-// 推程角: Φ, 远休止角: Φs, 回程角: Φ', 近休止角: Φ's
-// 本实现采用正弦加速度运动规律（无冲击）
+// 采用分段运动规律，各段间用5次多项式平滑过渡，实现无冲击运动
 func (cm *CamMechanism) CalculateProfilePoint(φ float64) CamProfilePoint {
 	params := cm.Params
 	Rb := params.BaseRadius
 	h := params.Lift
 
-	// 分段定义运动角
-	Φ := math.Pi / 2.0      // 推程角 90°
-	Φs := math.Pi / 4.0     // 远休止角 45°
-	Φprime := math.Pi / 2.0 // 回程角 90°
+	// 分段运动角定义（总2π）
+	// 缓冲段角度占比: 各15°
+	bufferAngle := 15.0 * math.Pi / 180.0 // 缓冲段角度 15°
+	Φ_main := math.Pi/2.0 - 2.0*bufferAngle // 主推程角
+	Φs := math.Pi / 4.0                       // 远休止角
+	Φprime_main := math.Pi/2.0 - 2.0*bufferAngle // 主回程角
+
+	// 各段起点角度
+	φ_start_buf1 := 0.0
+	φ_start_push := φ_start_buf1 + bufferAngle
+	φ_start_buf2 := φ_start_push + Φ_main
+	φ_start_dwell_far := φ_start_buf2 + bufferAngle
+	φ_start_buf3 := φ_start_dwell_far + Φs
+	φ_start_return := φ_start_buf3 + bufferAngle
+	φ_start_buf4 := φ_start_return + Φprime_main
+	φ_end := φ_start_buf4 + bufferAngle
 
 	// 归一化角度到 [0, 2π)
 	φNorm := math.Mod(φ, 2*math.Pi)
@@ -62,63 +113,109 @@ func (cm *CamMechanism) CalculateProfilePoint(φ float64) CamProfilePoint {
 		φNorm += 2 * math.Pi
 	}
 
-	// 计算从动件位移 s(φ)
-	s := 0.0
-	ds_dφ := 0.0
-	d2s_dφ2 := 0.0
+	// 计算从动件位移 s(φ) 及其导数
+	var s, ds_dφ, d2s_dφ2, d3s_dφ3 float64
 
-	if φNorm < Φ {
-		// 推程段: 正弦加速度运动规律
-		// s(φ) = h * [ (φ/Φ) - (1/(2π))*sin(2πφ/Φ) ]
-		// 该运动规律的特点: 速度连续, 加速度连续但有突变, 跃度有冲击
-		// 属于"柔性冲击", 适用于中速场合
-		ratio := φNorm / Φ
+	switch {
+	case φNorm < φ_start_push:
+		// 第一段缓冲: 从静止到主推程起始速度
+		T := φNorm / bufferAngle
+		s, ds_dφ, d2s_dφ2, d3s_dφ3 = quinticPolyBuffer(T, 0, 0, 0, bufferAngle, h, Φ_main, true)
+
+	case φNorm < φ_start_buf2:
+		// 主推程: 正弦加速度运动规律
+		ratio := (φNorm - φ_start_push) / Φ_main
+		s_main, v_main, a_main := sineAccelerationPush(ratio, h, Φ_main)
 		s = h * (ratio - math.Sin(2*math.Pi*ratio)/(2*math.Pi))
-		ds_dφ = h / Φ * (1 - math.Cos(2*math.Pi*ratio))
-		d2s_dφ2 = 2 * math.Pi * h / (Φ * Φ) * math.Sin(2*math.Pi*ratio)
-	} else if φNorm < Φ+Φs {
+		ds_dφ = h / Φ_main * (1 - math.Cos(2*math.Pi*ratio))
+		d2s_dφ2 = 2 * math.Pi * h / (Φ_main * Φ_main) * math.Sin(2*math.Pi*ratio)
+		d3s_dφ3 = 4 * math.Pi * math.Pi * h / (Φ_main * Φ_main * Φ_main) * math.Cos(2*math.Pi*ratio)
+		_, _, _ = s_main, v_main, a_main
+
+	case φNorm < φ_start_dwell_far:
+		// 第二段缓冲: 从主推程结束到远休止
+		T := (φNorm - φ_start_buf2) / bufferAngle
+		s_end := h
+		ds_end := 0.0
+		d2s_end := 0.0
+
+		// 主推程结束时的状态
+		s_start := h
+		ds_start := h / Φ_main * (1 - math.Cos(2*math.Pi))
+		d2s_start := 2 * math.Pi * h / (Φ_main * Φ_main) * math.Sin(2*math.Pi)
+
+		s, ds_dφ, d2s_dφ2, d3s_dφ3 = quinticPoly(
+			T,
+			s_start, ds_start, d2s_start,
+			s_end, ds_end, d2s_end,
+		)
+		_ = d3s_dφ3 // 暂时保留
+
+	case φNorm < φ_start_buf3:
 		// 远休止段
 		s = h
 		ds_dφ = 0.0
 		d2s_dφ2 = 0.0
-	} else if φNorm < Φ+Φs+Φprime {
-		// 回程段: 正弦加速度运动规律
-		ratio := (φNorm - Φ - Φs) / Φprime
+		d3s_dφ3 = 0.0
+
+	case φNorm < φ_start_return:
+		// 第三段缓冲: 从远休止到主回程起始
+		T := (φNorm - φ_start_buf3) / bufferAngle
+		s_start := h
+		ds_start := 0.0
+		d2s_start := 0.0
+		s_end := h
+		// 主回程开始时的速度（负的）
+		ds_end := -h / Φprime_main * (1 - math.Cos(0))
+
+		s, ds_dφ, d2s_dφ2, d3s_dφ3 = quinticPoly(
+			T,
+			s_start, ds_start, d2s_start,
+			s_end, ds_end, 0.0,
+		)
+
+	case φNorm < φ_start_buf4:
+		// 主回程: 正弦加速度运动规律
+		ratio := (φNorm - φ_start_return) / Φprime_main
 		s = h * (1 - ratio + math.Sin(2*math.Pi*ratio)/(2*math.Pi))
-		ds_dφ = -h / Φprime * (1 - math.Cos(2*math.Pi*ratio))
-		d2s_dφ2 = -2 * math.Pi * h / (Φprime * Φprime) * math.Sin(2*math.Pi*ratio)
-	} else {
-		// 近休止段
-		s = 0.0
-		ds_dφ = 0.0
-		d2s_dφ2 = 0.0
+		ds_dφ = -h / Φprime_main * (1 - math.Cos(2*math.Pi*ratio))
+		d2s_dφ2 = -2 * math.Pi * h / (Φprime_main * Φprime_main) * math.Sin(2*math.Pi*ratio)
+		d3s_dφ3 = -4 * math.Pi * math.Pi * h / (Φprime_main * Φprime_main * Φprime_main) * math.Cos(2*math.Pi*ratio)
+
+	default:
+		// 第四段缓冲: 从主回程结束到近休止
+		T := (φNorm - φ_start_buf4) / bufferAngle
+		s_start := 0.0
+		ds_start := -h / Φprime_main * (1 - math.Cos(2*math.Pi))
+		d2s_start := -2 * math.Pi * h / (Φprime_main * Φprime_main) * math.Sin(2*math.Pi)
+
+		s, ds_dφ, d2s_dφ2, d3s_dφ3 = quinticPoly(
+			T,
+			s_start, ds_start, d2s_start,
+			0.0, 0.0, 0.0,
+		)
 	}
 
 	// 向径 r(φ) = Rb + s(φ)
 	r := Rb + s
 
-	// 直角坐标 (极坐标转换)
-	// x = r(φ) * cos(φ), y = r(φ) * sin(φ)
+	// 直角坐标
 	x := r * math.Cos(φ)
 	y := r * math.Sin(φ)
 
-	// 计算切线方向和法向量
-	// 切线向量: dr/dφ = (ds/dφ*cosφ - r*sinφ, ds/dφ*sinφ + r*cosφ)
+	// 切线方向和法向量
 	dx_dφ := ds_dφ*math.Cos(φ) - r*math.Sin(φ)
 	dy_dφ := ds_dφ*math.Sin(φ) + r*math.Cos(φ)
 
-	// 切线方向单位向量
 	tangentMag := math.Sqrt(dx_dφ*dx_dφ + dy_dφ*dy_dφ)
 	tx := dx_dφ / tangentMag
 	ty := dy_dφ / tangentMag
 
-	// 法向量（指向凸轮中心的内侧法线）
-	// 法线方向为切线旋转90°: n = (-ty, tx)
+	// 法向量
 	nx := -ty
 	ny := tx
 
-	// 计算曲率 κ(φ)
-	// 曲率公式: κ = |x'y'' - x''y'| / (x'² + y'²)^(3/2)
+	// 曲率计算
 	d2x_dφ2 := (d2s_dφ2 - r)*math.Cos(φ) - 2*ds_dφ*math.Sin(φ)
 	d2y_dφ2 := (d2s_dφ2 - r)*math.Sin(φ) + 2*ds_dφ*math.Cos(φ)
 
@@ -126,8 +223,7 @@ func (cm *CamMechanism) CalculateProfilePoint(φ float64) CamProfilePoint {
 	denominator := math.Pow(dx_dφ*dx_dφ + dy_dφ*dy_dφ, 1.5)
 	curvature := numerator / denominator
 
-	// 压力角计算
-	// tan(α) = |ds/dφ| / (Rb + s)
+	// 压力角
 	pressureAngle := math.Atan(math.Abs(ds_dφ) / (Rb + s))
 
 	return CamProfilePoint{
@@ -141,22 +237,53 @@ func (cm *CamMechanism) CalculateProfilePoint(φ float64) CamProfilePoint {
 	}
 }
 
-// CalculateFollowerMotion 计算从动件运动学参数
+// quinticPolyBuffer 缓冲段5次多项式（专用版本）
+// 从静止平滑过渡到正弦加速度主段的起始速度
+func quinticPolyBuffer(T float64, s0, v0, a0 float64, bufferAngle float64, h float64, mainAngle float64, isPush bool) (s, v, a, j float64) {
+	// 主段起始时的速度和加速度（正弦加速度规律）
+	mainVel := h / mainAngle * (1 - math.Cos(0))
+	mainAcc := 2 * math.Pi * h / (mainAngle * mainAngle) * math.Sin(0)
+
+	if !isPush {
+		mainVel = -mainVel
+	}
+
+	// 缓冲段终点位移（近似为主段起点的位移）
+	s_end := h * 0.02 // 缓冲段只走2%的升程，主要是速度过渡
+	v_end := mainVel
+	a_end := mainAcc
+
+	s, v, a, j = quinticPoly(T, s0, v0, a0, s_end, v_end, a_end)
+	return
+}
+
+// sineAccelerationPush 正弦加速度推程计算
+func sineAccelerationPush(ratio float64, h float64, Φ float64) (s, v, a float64) {
+	s = h * (ratio - math.Sin(2*math.Pi*ratio)/(2*math.Pi))
+	v = h / Φ * (1 - math.Cos(2*math.Pi*ratio))
+	a = 2 * math.Pi * h / (Φ * Φ) * math.Sin(2*math.Pi*ratio)
+	return
+}
+
+// CalculateFollowerMotion 计算从动件运动学参数（理想运动，不考虑弹簧缓冲）
 // 输入: 凸轮转角 φ [rad], 角速度 ω [rad/s]
-// 输出: 从动件位移 s, 速度 v, 加速度 a, 跃度 j
-//
-// 正弦加速度运动规律（推程）:
-//   s(φ) = h[ φ/Φ - (1/2π)sin(2πφ/Φ) ]
-//   v(φ) = ds/dt = (ds/dφ)(dφ/dt) = ω h/Φ [1 - cos(2πφ/Φ)]
-//   a(φ) = dv/dt = ω² 2πh/Φ² sin(2πφ/Φ)
-//   j(φ) = da/dt = ω³ 4π²h/Φ³ cos(2πφ/Φ)
-func (cm *CamMechanism) CalculateFollowerMotion(φ float64, ω float64) CamFollowerState {
+// 输出: 从动件位移、速度、加速度、跃度
+func (cm *CamMechanism) CalculateIdealFollowerMotion(φ float64, ω float64) CamFollowerState {
 	params := cm.Params
 	h := params.Lift
 
-	Φ := math.Pi / 2.0      // 推程角
-	Φs := math.Pi / 4.0     // 远休止角
-	Φprime := math.Pi / 2.0 // 回程角
+	bufferAngle := 15.0 * math.Pi / 180.0
+	Φ_main := math.Pi/2.0 - 2.0*bufferAngle
+	Φs := math.Pi / 4.0
+	Φprime_main := math.Pi/2.0 - 2.0*bufferAngle
+
+	φ_start_buf1 := 0.0
+	φ_start_push := φ_start_buf1 + bufferAngle
+	φ_start_buf2 := φ_start_push + Φ_main
+	φ_start_dwell_far := φ_start_buf2 + bufferAngle
+	φ_start_buf3 := φ_start_dwell_far + Φs
+	φ_start_return := φ_start_buf3 + bufferAngle
+	φ_start_buf4 := φ_start_return + Φprime_main
 
 	φNorm := math.Mod(φ, 2*math.Pi)
 	if φNorm < 0 {
@@ -165,67 +292,57 @@ func (cm *CamMechanism) CalculateFollowerMotion(φ float64, ω float64) CamFollo
 
 	var s, ds_dφ, d2s_dφ2, d3s_dφ3 float64
 
-	if φNorm < Φ {
-		// 推程段: 正弦加速度
-		ratio := φNorm / Φ
-		arg := 2 * math.Pi * ratio
+	switch {
+	case φNorm < φ_start_push:
+		T := φNorm / bufferAngle
+		s, ds_dφ, d2s_dφ2, d3s_dφ3 = quinticPolyBuffer(T, 0, 0, 0, bufferAngle, h, Φ_main, true)
 
-		// 位移方程: s = h[ φ/Φ - (1/2π)sin(2πφ/Φ) ]
-		s = h * (ratio - math.Sin(arg)/(2*math.Pi))
+	case φNorm < φ_start_buf2:
+		ratio := (φNorm - φ_start_push) / Φ_main
+		s = h * (ratio - math.Sin(2*math.Pi*ratio)/(2*math.Pi))
+		ds_dφ = h / Φ_main * (1 - math.Cos(2*math.Pi*ratio))
+		d2s_dφ2 = 2 * math.Pi * h / (Φ_main * Φ_main) * math.Sin(2*math.Pi*ratio)
+		d3s_dφ3 = 4 * math.Pi * math.Pi * h / (Φ_main * Φ_main * Φ_main) * math.Cos(2*math.Pi*ratio)
 
-		// 一阶导数: ds/dφ = h/Φ [1 - cos(2πφ/Φ)]
-		ds_dφ = h / Φ * (1 - math.Cos(arg))
+	case φNorm < φ_start_dwell_far:
+		T := (φNorm - φ_start_buf2) / bufferAngle
+		s_start := h
+		ds_start := h / Φ_main * (1 - math.Cos(2*math.Pi))
+		d2s_start := 2 * math.Pi * h / (Φ_main * Φ_main) * math.Sin(2*math.Pi)
+		s, ds_dφ, d2s_dφ2, d3s_dφ3 = quinticPoly(T, s_start, ds_start, d2s_start, h, 0, 0)
 
-		// 二阶导数: d²s/dφ² = 2πh/Φ² sin(2πφ/Φ)
-		d2s_dφ2 = 2 * math.Pi * h / (Φ * Φ) * math.Sin(arg)
-
-		// 三阶导数: d³s/dφ³ = 4π²h/Φ³ cos(2πφ/Φ)
-		d3s_dφ3 = 4 * math.Pi * math.Pi * h / (Φ * Φ * Φ) * math.Cos(arg)
-
-	} else if φNorm < Φ+Φs {
-		// 远休止段: s = h, 各阶导数为0
+	case φNorm < φ_start_buf3:
 		s = h
 		ds_dφ = 0.0
 		d2s_dφ2 = 0.0
 		d3s_dφ3 = 0.0
 
-	} else if φNorm < Φ+Φs+Φprime {
-		// 回程段: 正弦加速度
-		ratio := (φNorm - Φ - Φs) / Φprime
-		arg := 2 * math.Pi * ratio
+	case φNorm < φ_start_return:
+		T := (φNorm - φ_start_buf3) / bufferAngle
+		s_start := h
+		ds_start := 0.0
+		d2s_start := 0.0
+		ds_end := -h / Φprime_main * (1 - math.Cos(0))
+		s, ds_dφ, d2s_dφ2, d3s_dφ3 = quinticPoly(T, s_start, ds_start, d2s_start, h, ds_end, 0)
 
-		// 位移方程: s = h[ 1 - φ/Φ' + (1/2π)sin(2πφ/Φ') ]
-		s = h * (1 - ratio + math.Sin(arg)/(2*math.Pi))
+	case φNorm < φ_start_buf4:
+		ratio := (φNorm - φ_start_return) / Φprime_main
+		s = h * (1 - ratio + math.Sin(2*math.Pi*ratio)/(2*math.Pi))
+		ds_dφ = -h / Φprime_main * (1 - math.Cos(2*math.Pi*ratio))
+		d2s_dφ2 = -2 * math.Pi * h / (Φprime_main * Φprime_main) * math.Sin(2*math.Pi*ratio)
+		d3s_dφ3 = -4 * math.Pi * math.Pi * h / (Φprime_main * Φprime_main * Φprime_main) * math.Cos(2*math.Pi*ratio)
 
-		// 一阶导数: ds/dφ = -h/Φ' [1 - cos(2πφ/Φ')]
-		ds_dφ = -h / Φprime * (1 - math.Cos(arg))
-
-		// 二阶导数: d²s/dφ² = -2πh/Φ'^2 sin(2πφ/Φ')
-		d2s_dφ2 = -2 * math.Pi * h / (Φprime * Φprime) * math.Sin(arg)
-
-		// 三阶导数: d³s/dφ³ = -4π²h/Φ'^3 cos(2πφ/Φ')
-		d3s_dφ3 = -4 * math.Pi * math.Pi * h / (Φprime * Φprime * Φprime) * math.Cos(arg)
-
-	} else {
-		// 近休止段
-		s = 0.0
-		ds_dφ = 0.0
-		d2s_dφ2 = 0.0
-		d3s_dφ3 = 0.0
+	default:
+		T := (φNorm - φ_start_buf4) / bufferAngle
+		s_start := 0.0
+		ds_start := -h / Φprime_main * (1 - math.Cos(2*math.Pi))
+		d2s_start := -2 * math.Pi * h / (Φprime_main * Φprime_main) * math.Sin(2*math.Pi)
+		s, ds_dφ, d2s_dφ2, d3s_dφ3 = quinticPoly(T, s_start, ds_start, d2s_start, 0, 0, 0)
 	}
 
-	// 转换为时间导数
-	// 速度: v = ds/dt = (ds/dφ)(dφ/dt) = ω * ds/dφ
 	velocity := ω * ds_dφ
-
-	// 加速度: a = dv/dt = d/dt(ω ds/dφ) = ω² d²s/dφ² (假设ω恒定)
 	acceleration := ω * ω * d2s_dφ2
-
-	// 跃度: j = da/dt = ω³ d³s/dφ³
 	jerk := ω * ω * ω * d3s_dφ3
-
-	// 压力角计算
-	// tan(α) = |ds/dφ| / (Rb + s)
 	pressureAngle := math.Atan(math.Abs(ds_dφ) / (params.BaseRadius + s))
 
 	return CamFollowerState{
@@ -237,19 +354,103 @@ func (cm *CamMechanism) CalculateFollowerMotion(φ float64, ω float64) CamFollo
 	}
 }
 
+// UpdateFollowerWithSpring 考虑缓冲弹簧的从动件运动更新
+// 使用弹簧-质量-阻尼系统模拟真实接触，防止脱击和冲击
+// 输入: 凸轮转角变化 dφ, 角速度 ω, 时间步长 dt
+func (cm *CamMechanism) UpdateFollowerWithSpring(prevState CamFollowerState, φ float64, ω float64, dt float64) CamFollowerState {
+	// 计算理想的从动件位移（凸轮轮廓决定的位移）
+	ideal := cm.CalculateIdealFollowerMotion(φ, ω)
+
+	// 当前弹簧变形量 = 理想位移 - 实际位移
+	// 正值表示弹簧被压缩，产生弹力推动从动件
+	springDeflection := ideal.Displacement - prevState.Displacement
+
+	// 弹簧力（胡克定律 + 预紧力）
+	springForce := cm.BufferSpring.Preload + cm.BufferSpring.Stiffness*springDeflection
+
+	// 相对速度（凸轮速度 - 从动件速度）
+	relativeVel := ideal.Velocity - prevState.Velocity
+
+	// 阻尼力
+	dampingForce := cm.BufferSpring.Damping * relativeVel
+
+	// 总力 = 弹簧力 + 阻尼力 - 外载荷
+	totalForce := springForce + dampingForce - cm.ExternalLoad
+
+	// 判断是否保持接触
+	// 当弹簧力 > 0 时，凸轮与从动件保持接触
+	isContacting := springForce > 0
+
+	// 限制弹簧最大压缩量
+	if springDeflection > cm.BufferSpring.MaxCompression {
+		springDeflection = cm.BufferSpring.MaxCompression
+		springForce = cm.BufferSpring.Preload + cm.BufferSpring.Stiffness*springDeflection
+	}
+
+	// 计算从动件加速度（牛顿第二定律）
+	// F = ma → a = F/m
+	var followerAcc float64
+	if isContacting {
+		// 接触状态: 弹簧力推动从动件
+		followerAcc = totalForce / cm.BufferSpring.EquivalentMass
+	} else {
+		// 脱击状态: 只有外载荷和阻尼作用（自由飞行/回落）
+		followerAcc = (-cm.ExternalLoad - dampingForce) / cm.BufferSpring.EquivalentMass
+	}
+
+	// 欧拉积分更新速度和位移
+	newVelocity := prevState.Velocity + followerAcc*dt
+	newDisplacement := prevState.Displacement + newVelocity*dt
+
+	// 防止位移小于0（物理限制）
+	if newDisplacement < 0 {
+		newDisplacement = 0
+		if newVelocity < 0 {
+			newVelocity = 0
+		}
+	}
+
+	// 冲击速度（接触瞬间的相对速度，用于评估冲击程度）
+	impactVel := 0.0
+	if !prevState.IsContacting && isContacting {
+		impactVel = math.Abs(ideal.Velocity - prevState.Velocity)
+	}
+
+	// 接触力计算（考虑压力角和摩擦）
+	contactForce := 0.0
+	if isContacting {
+		α := ideal.PressureAngle
+		mu := cm.Params.FrictionCoeff
+		denominator := math.Cos(α) - mu*math.Sin(α)
+		if math.Abs(denominator) > 1e-10 {
+			contactForce = springForce / denominator
+		} else {
+			contactForce = springForce * 10.0 // 自锁临界
+		}
+	}
+
+	return CamFollowerState{
+		Displacement:     newDisplacement,
+		Velocity:         newVelocity,
+		Acceleration:     followerAcc,
+		Jerk:             ideal.Jerk,
+		PressureAngle:    ideal.PressureAngle,
+		SpringForce:      springForce,
+		SpringDeflection: springDeflection,
+		ContactForce:     math.Max(0, contactForce),
+		IsContacting:     isContacting,
+		ImpactVelocity:   impactVel,
+	}
+}
+
+// CalculateFollowerMotion 计算从动件运动学参数（兼容旧接口）
+// 默认使用理想运动学（不考虑弹簧缓冲）
+func (cm *CamMechanism) CalculateFollowerMotion(φ float64, ω float64) CamFollowerState {
+	return cm.CalculateIdealFollowerMotion(φ, ω)
+}
+
 // CalculateContactForce 计算凸轮-从动件接触力
-// 输入: 从动件运动状态, 从动件等效质量 meq, 外载荷 Fload
-// 输出: 法向接触力 Fn
-//
-// 力平衡方程（沿从动件运动方向）:
-//   Fn * cos(α) - Ff * sin(α) = meq * a + F_load + F_spring + F_damper
-//   其中:
-//     Ff = μ * Fn (库仑摩擦力)
-//     F_spring = k * s (弹簧力)
-//     F_damper = c * v (阻尼力)
-//
-// 整理得:
-//   Fn = (meq * a + F_load + k*s + c*v) / (cosα - μ*sinα)
+// 已包含缓冲弹簧力的影响
 func (cm *CamMechanism) CalculateContactForce(
 	follower CamFollowerState,
 	meq float64,
@@ -259,38 +460,31 @@ func (cm *CamMechanism) CalculateContactForce(
 	mu float64,
 ) float64 {
 	α := follower.PressureAngle
-	s := follower.Displacement
-	v := follower.Velocity
-	a := follower.Acceleration
+	_ = meq
+	_ = springK
+	_ = damperC
+	_ = Fload
 
-	// 弹簧力
-	Fspring := springK * s
+	// 已在 UpdateFollowerWithSpring 中计算过
+	if follower.ContactForce > 0 {
+		return follower.ContactForce
+	}
 
-	// 阻尼力
-	Fdamper := damperC * v
-
-	// 惯性力
-	Finertial := meq * a
-
-	// 分母（力的几何投影系数）
+	// 兼容模式：使用旧方法估算
+	Fn := follower.SpringForce
 	denominator := math.Cos(α) - mu*math.Sin(α)
 	if math.Abs(denominator) < 1e-10 {
 		denominator = 1e-10 * math.Copysign(1.0, denominator)
 	}
-
-	// 法向接触力
-	Fn := (Finertial + Fload + Fspring + Fdamper) / denominator
-
-	return math.Max(0.0, Fn) // 不能有拉力，只能有压力
+	return math.Max(0.0, Fn/denominator)
 }
 
 // AutoLoadingController 自动装填时序控制器
-// 控制弩的自动装填过程，包括：拉弦、锁止、装箭、释放
 type AutoLoadingController struct {
-	CurrentPhase  int
+	CurrentPhase   int
 	PhaseStartTime float64
-	Sequence      []LoadingSequence
-	CamMechanism  *CamMechanism
+	Sequence       []LoadingSequence
+	CamMechanism   *CamMechanism
 }
 
 // NewAutoLoadingController 创建自动装填控制器
@@ -309,8 +503,6 @@ func NewAutoLoadingController(cam *CamMechanism) *AutoLoadingController {
 }
 
 // Update 更新装填时序
-// 输入: 当前时间 t [s]
-// 输出: 当前阶段索引, 是否完成全部装填
 func (alc *AutoLoadingController) Update(t float64) (int, bool) {
 	allCompleted := true
 
@@ -334,11 +526,6 @@ func (alc *AutoLoadingController) Update(t float64) (int, bool) {
 }
 
 // GetPhaseOutput 获取当前阶段的控制输出
-// 输出:
-//   camTargetAngle: 凸轮目标转角 [rad]
-//   pawlCommand: 棘爪指令 (-1:脱开, 0:保持, 1:啮合)
-//   arrowLoad: 是否装箭
-//   trigger: 是否触发发射
 func (alc *AutoLoadingController) GetPhaseOutput(t float64) (float64, int, bool, bool) {
 	phase := alc.CurrentPhase
 	seq := alc.Sequence[phase]
@@ -352,43 +539,36 @@ func (alc *AutoLoadingController) GetPhaseOutput(t float64) (float64, int, bool,
 
 	switch phase {
 	case 0:
-		// 初始位置: 凸轮在近休止位置
 		camTargetAngle = 0.0
 		pawlCommand = 0
 		arrowLoad = false
 		trigger = false
 
 	case 1:
-		// 拉弦阶段: 凸轮旋转拉弦
-		// 推程角 90°，使用正弦加速曲线
 		camTargetAngle = progress * math.Pi / 2.0
 		pawlCommand = 0
 		arrowLoad = false
 		trigger = false
 
 	case 2:
-		// 锁止阶段: 棘爪啮合锁止
-		camTargetAngle = math.Pi/2.0 + math.Pi/4.0*progress // 进入远休止
+		camTargetAngle = math.Pi/2.0 + math.Pi/4.0*progress
 		pawlCommand = 1
 		arrowLoad = false
 		trigger = false
 
 	case 3:
-		// 装箭阶段
 		camTargetAngle = math.Pi / 2.0
 		pawlCommand = 1
 		arrowLoad = true
 		trigger = false
 
 	case 4:
-		// 触发阶段: 棘爪脱开
-		camTargetAngle = math.Pi/2.0 + math.Pi/4.0 // 远休止位置
+		camTargetAngle = math.Pi/2.0 + math.Pi/4.0
 		pawlCommand = -1
 		arrowLoad = true
 		trigger = false
 
 	case 5:
-		// 发射阶段: 凸轮继续旋转完成回程
 		camTargetAngle = math.Pi/2.0 + math.Pi/4.0 + math.Pi/2.0*progress
 		pawlCommand = -1
 		arrowLoad = true
@@ -406,25 +586,39 @@ func (cm *CamMechanism) GetFollowerPosition(φ float64) mat.VecDense {
 }
 
 // CheckPressureAngle 校验压力角是否在允许范围内
-// 一般推荐: α_max ≤ 30°~45° (直动从动件)
-//          α_max ≤ 40°~50° (摆动从动件)
 func (cm *CamMechanism) CheckPressureAngle(α float64) bool {
 	maxAllowed := cm.Params.PressureAngle
 	if maxAllowed <= 0 {
-		maxAllowed = 30.0 * math.Pi / 180.0 // 默认30°
+		maxAllowed = 30.0 * math.Pi / 180.0
 	}
 	return α <= maxAllowed
 }
 
 // CalculateTorque 计算驱动凸轮所需扭矩
-// 输入: 接触力 Fn, 压力角 α, 基圆半径 Rb, 从动件位移 s
-// 扭矩: T = Fn * (Rb + s) * sin(α)
-// 物理意义: 扭矩等于法向力乘以力臂，力臂是接触点到凸轮中心的垂直距离
 func (cm *CamMechanism) CalculateTorque(Fn float64, follower CamFollowerState) float64 {
 	α := follower.PressureAngle
 	s := follower.Displacement
 	Rb := cm.Params.BaseRadius
 
-	// T = Fn * (Rb + s) * sin(α)
 	return Fn * (Rb + s) * math.Sin(α)
+}
+
+// CheckJamming 检查机构是否有卡死风险
+// 基于压力角、弹簧力、摩擦系数判断
+func (cm *CamMechanism) CheckJamming(follower CamFollowerState) bool {
+	α := follower.PressureAngle
+	mu := cm.Params.FrictionCoeff
+
+	// 自锁条件: tan(α) >= 1/μ
+	// 当压力角太大且摩擦系数足够时，机构可能自锁
+	if math.Tan(α) >= 1.0/mu {
+		return true
+	}
+
+	// 弹簧力不足导致脱击后无法回位
+	if !follower.IsContacting && follower.SpringDeflection > cm.BufferSpring.MaxCompression*0.8 {
+		return true
+	}
+
+	return false
 }

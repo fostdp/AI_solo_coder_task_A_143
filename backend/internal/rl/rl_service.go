@@ -21,25 +21,28 @@ type RLService struct {
 
 func DefaultTrainingConfig() TrainingConfig {
 	return TrainingConfig{
-		StateDimension:      5,
-		ActionDimension:     5,
-		ReplayBufferSize:    10000,
-		BatchSize:           64,
-		Gamma:               0.99,
-		EpsilonStart:        1.0,
-		EpsilonEnd:          0.01,
-		EpsilonDecay:        0.995,
-		LearningRate:        0.001,
-		TargetUpdateFreq:    100,
-		MaxEpisodes:         1000,
-		ConvergenceWindow:   100,
+		StateDimension:       5,
+		ActionDimension:      5,
+		ReplayBufferSize:     10000,
+		BatchSize:            64,
+		Gamma:                0.99,
+		EpsilonStart:         1.0,
+		EpsilonEnd:           0.01,
+		EpsilonDecay:         0.995,
+		LearningRate:         0.001,
+		TargetUpdateFreq:     100,
+		MaxEpisodes:          1000,
+		ConvergenceWindow:    100,
 		ConvergenceThreshold: 0.01,
-		FireRateWeight:      10.0,
-		FatiguePenalty:      100.0,
-		LowFireRatePenalty:  50.0,
-		MinFireRate:         6.0,
-		FatigueThreshold:    0.8,
-		BaseLoadingInterval: 5.0,
+		FireRateWeight:       10.0,
+		FatiguePenalty:       100.0,
+		LowFireRatePenalty:   50.0,
+		MinFireRate:          6.0,
+		FatigueThreshold:     0.8,
+		BaseLoadingInterval:  5.0,
+		PretrainEpisodes:     50,
+		PretrainEpochs:       20,
+		EnablePretrain:       true,
 	}
 }
 
@@ -93,6 +96,30 @@ func (s *RLService) StartTraining(crossbowID string, magazineCapacity int) {
 
 	s.metricsHistory = make([]TrainingMetrics, 0, s.config.MaxEpisodes)
 	s.agent.Reset()
+
+	// 如果启用预训练，则先执行预训练
+	if s.config.EnablePretrain {
+		s.runPretraining(magazineCapacity)
+	}
+}
+
+// runPretraining 执行预训练（模仿学习）
+func (s *RLService) runPretraining(magazineCapacity int) {
+	// 1. 生成专家演示数据
+	expertPolicy := NewExpertPolicy(s.config)
+	demonstrations := expertPolicy.GenerateDemonstrations(
+		s.config.PretrainEpisodes,
+		magazineCapacity,
+	)
+
+	// 2. 使用演示数据进行行为克隆预训练
+	_ = s.agent.PretrainWithDemonstrations(demonstrations, s.config.PretrainEpochs)
+
+	// 3. 将演示数据加载到经验回放池
+	s.agent.LoadDemonstrationsIntoReplayBuffer(demonstrations)
+
+	// 更新epsilon（预训练后降低探索率）
+	s.trainingState.Epsilon = s.agent.GetEpsilon()
 }
 
 func (s *RLService) RunTrainingEpisode(magazineCapacity int) TrainingMetrics {

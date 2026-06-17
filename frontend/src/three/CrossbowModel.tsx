@@ -5,6 +5,7 @@ import { CrossbowModelProps, CrossbowState, DEFAULT_CROSSBOW_CONFIG, DEFAULT_PHY
 import { BowString } from './BowString';
 import { Arrow, SingleArrow } from './Arrow';
 import { PredictedTrajectory } from './TrajectoryLine';
+import { Magazine } from './Magazine';
 
 export function CrossbowModel({
   state,
@@ -15,7 +16,6 @@ export function CrossbowModel({
   const groupRef = useRef<THREE.Group>(null);
   const leftArmRef = useRef<THREE.Mesh>(null);
   const rightArmRef = useRef<THREE.Mesh>(null);
-  const magazineRef = useRef<THREE.Mesh>(null);
   const camRef = useRef<THREE.Group>(null);
   const pawlRef = useRef<THREE.Mesh>(null);
   const [activeArrows, setActiveArrows] = useState<Array<{ id: number; pos: THREE.Vector3; vel: THREE.Vector3 }>>([]);
@@ -70,12 +70,6 @@ export function CrossbowModel({
       config.bowArm.length
     );
 
-    const magazineGeometry = new THREE.BoxGeometry(
-      config.magazine.width,
-      config.magazine.height,
-      config.magazine.depth
-    );
-
     const camGroup = new THREE.Group();
     const camBase = new THREE.CylinderGeometry(
       config.cam.radius,
@@ -105,7 +99,6 @@ export function CrossbowModel({
     return {
       bodyGeometry,
       armGeometry,
-      magazineGeometry,
       camGroup,
       pawlGeometry,
     };
@@ -117,9 +110,6 @@ export function CrossbowModel({
     }
     if (rightArmRef.current) {
       rightArmRef.current.rotation.y = -bowArmAngle;
-    }
-    if (magazineRef.current) {
-      magazineRef.current.position.z = -0.1 + state.magazinePosition * 0.15;
     }
     if (camRef.current) {
       camRef.current.rotation.y = state.camRotation;
@@ -195,22 +185,12 @@ export function CrossbowModel({
 
       <BowString tension={state.tension} />
 
-      <mesh
-        ref={magazineRef}
-        geometry={geometries.magazineGeometry}
-        material={woodMaterial}
-        position={[0, -0.08, -0.1]}
-      >
-        <mesh
-          geometry={new THREE.BoxGeometry(
-            config.magazine.width * 0.9,
-            config.magazine.height * 0.2,
-            config.magazine.depth * (1 - state.magazinePosition)
-          )}
-          material={metalMaterial}
-          position={[0, config.magazine.height * 0.3, -config.magazine.depth * state.magazinePosition * 0.5]}
-        />
-      </mesh>
+      <Magazine
+        position={state.magazinePosition}
+        config={config}
+        arrowCount={Math.floor(state.magazinePosition * 10) + 1}
+        maxArrows={10}
+      />
 
       <group ref={camRef} position={[0.08, -0.02, 0]}>
         {geometries.camGroup.children.map((child, i) => (

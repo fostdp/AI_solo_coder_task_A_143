@@ -42,6 +42,18 @@ type CamParams struct {
 	Lift          float64       // 升程 h [m]
 	RotationSpeed float64       // 转速 ω [rad/s]
 	PhaseAngle    float64       // 相位角 φ0 [rad]
+	FrictionCoeff float64       // 摩擦系数 μ
+	RotSpeed      float64       // 转速 (兼容字段) [rad/s]
+}
+
+// BufferSpringParams 缓冲弹簧参数
+// 用于消除凸轮机构高速运动时的冲击，保证从动件与凸轮始终接触
+type BufferSpringParams struct {
+	Stiffness       float64 // 弹簧刚度 k_buffer [N/m]
+	Preload         float64 // 预紧力 F0 [N]，保证零速时仍有接触压力
+	Damping         float64 // 阻尼系数 c_buffer [N·s/m]，吸收冲击能量
+	MaxCompression  float64 // 最大压缩量 δ_max [m]
+	EquivalentMass  float64 // 等效质量 meq [kg]，用于弹簧-质量系统
 }
 
 // PawlRatchetParams 棘爪棘轮参数
@@ -98,11 +110,16 @@ type BowArmState struct {
 
 // CamFollowerState 凸轮从动件状态
 type CamFollowerState struct {
-	Displacement  float64       // 位移 s [m]
-	Velocity      float64       // 速度 v [m/s]
-	Acceleration  float64       // 加速度 a [m/s²]
-	Jerk          float64       // 跃度 j [m/s³]
-	PressureAngle float64       // 压力角 α [rad]
+	Displacement    float64       // 位移 s [m]
+	Velocity        float64       // 速度 v [m/s]
+	Acceleration    float64       // 加速度 a [m/s²]
+	Jerk            float64       // 跃度 j [m/s³]
+	PressureAngle   float64       // 压力角 α [rad]
+	SpringForce     float64       // 缓冲弹簧力 F_spring [N]
+	SpringDeflection float64      // 弹簧变形量 δ [m]
+	ContactForce    float64       // 接触力 Fn [N]
+	IsContacting    bool          // 是否保持接触
+	ImpactVelocity  float64       // 冲击速度 v_impact [m/s]
 }
 
 // StringState 弓弦状态

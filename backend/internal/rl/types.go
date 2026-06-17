@@ -61,6 +61,9 @@ type TrainingConfig struct {
 	MinFireRate         float64
 	FatigueThreshold    float64
 	BaseLoadingInterval float64
+	PretrainEpisodes    int     // 预训练演示episode数
+	PretrainEpochs      int     // 预训练轮数
+	EnablePretrain      bool    // 是否启用预训练
 }
 
 type TrainingMetrics struct {
