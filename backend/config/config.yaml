@@ -1,0 +1,36 @@
+server:
+  host: "0.0.0.0"
+  port: 8080
+  read_timeout: 30
+  write_timeout: 30
+
+database:
+  host: "localhost"
+  port: 5432
+  user: "postgres"
+  password: "postgres"
+  dbname: "crossbow_db"
+  sslmode: "disable"
+  max_open_conns: 20
+  max_idle_conns: 10
+
+redis:
+  host: "localhost"
+  port: 6379
+  password: ""
+  db: 0
+  pool_size: 20
+
+simulation:
+  time_step: 0.01
+  speed_multiplier: 1.0
+  enable_rl_optimization: true
+
+alert:
+  check_interval: 5
+  cooldown_period: 60
+
+websocket:
+  ping_interval: 30
+  pong_timeout: 60
+  write_wait: 10
