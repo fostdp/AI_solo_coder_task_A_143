@@ -98,6 +98,18 @@ type AlertThresholds struct {
 	UpdatedAt           time.Time `json:"updatedAt"`
 }
 
+// FatigueState 疲劳状态（与simulation.FatigueState兼容）
+type FatigueState struct {
+	StringFatigue       float64     `json:"stringFatigue"`
+	TotalDamage         float64     `json:"totalDamage"`
+	MaxStress           float64     `json:"maxStress"`
+	Cycles              float64     `json:"cycles"`
+	TotalDeltaL         float64     `json:"totalDeltaL"`
+	CurrentLifeFraction float64     `json:"currentLifeFraction"`
+	TensionHistory      []float64   `json:"tensionHistory,omitempty"`
+	LastUpdated         time.Time   `json:"lastUpdated"`
+}
+
 type RLStatus struct {
 	IsTraining        bool      `json:"isTraining"`
 	Episode           int       `json:"episode"`

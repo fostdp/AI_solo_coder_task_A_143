@@ -13,6 +13,7 @@ func SetupRoutes(r *gin.Engine, ctrl *Controller) {
 	api := r.Group("/api/v1")
 	{
 		api.GET("/health", ctrl.HealthCheck)
+		api.GET("/system-stats", ctrl.GetSystemStats)
 
 		crossbows := api.Group("/crossbows")
 		{
@@ -39,8 +40,6 @@ func SetupRoutes(r *gin.Engine, ctrl *Controller) {
 		{
 			alerts.GET("", ctrl.GetAlerts)
 			alerts.POST("/:id/ack", ctrl.AcknowledgeAlert)
-			alerts.GET("/thresholds/:id", ctrl.GetAlertThresholds)
-			alerts.PUT("/thresholds", ctrl.UpdateAlertThresholds)
 		}
 
 		rl := api.Group("/rl")
@@ -48,8 +47,8 @@ func SetupRoutes(r *gin.Engine, ctrl *Controller) {
 			rl.POST("/train/:id", ctrl.StartRLTraining)
 			rl.GET("/status/:id", ctrl.GetRLStatus)
 			rl.GET("/result/:id", ctrl.GetRLResult)
-			rl.POST("/pause", ctrl.PauseRLTraining)
-			rl.POST("/resume", ctrl.ResumeRLTraining)
+			rl.POST("/pause/:id", ctrl.PauseRLTraining)
+			rl.POST("/resume/:id", ctrl.ResumeRLTraining)
 		}
 	}
 

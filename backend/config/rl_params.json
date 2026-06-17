@@ -1,0 +1,74 @@
+{
+  "agent": {
+    "state_dimension": 5,
+    "action_dimension": 5,
+    "replay_buffer_size": 10000,
+    "batch_size": 64,
+    "gamma": 0.99,
+    "epsilon_start": 1.0,
+    "epsilon_end": 0.01,
+    "epsilon_decay": 0.995,
+    "learning_rate": 0.001,
+    "target_update_freq": 100,
+    "gradient_clip_norm": 1.0,
+    "hidden_layer_size": 128,
+    "num_layers": 2
+  },
+  "training": {
+    "max_episodes": 1000,
+    "max_steps_per_episode": 200,
+    "convergence_window": 100,
+    "convergence_threshold": 0.01,
+    "fire_rate_weight": 10.0,
+    "fatigue_penalty": 100.0,
+    "low_fire_rate_penalty": 50.0,
+    "min_fire_rate": 6.0,
+    "fatigue_threshold": 0.8,
+    "base_loading_interval": 5.0,
+    "overfatigue_penalty": 50.0,
+    "empty_magazine_penalty": 20.0,
+    "fire_rate_increase_reward": 10.0
+  },
+  "pretrain": {
+    "enable_pretrain": true,
+    "pretrain_episodes": 50,
+    "pretrain_epochs": 20,
+    "pretrain_learning_rate_multiplier": 3.0,
+    "expert_action_target_value": 100.0,
+    "other_action_target_value": -10.0,
+    "pretrain_epsilon_reduction": 0.7
+  },
+  "expert_policy": {
+    "high_fatigue_threshold": 0.9,
+    "medium_fatigue_threshold": 0.7,
+    "low_fatigue_threshold": 0.5,
+    "very_low_fatigue_threshold": 0.3,
+    "low_fire_rate_major_threshold": 0.7,
+    "low_fire_rate_minor_threshold": 0.9,
+    "high_fire_rate_threshold": 1.1,
+    "target_fire_rate": 10.0,
+    "cooldown_steps": 5,
+    "cooldown_fatigue_reduction": 0.05,
+    "non_cooldown_fatigue_reduction": 0.02,
+    "base_fatigue_growth": 0.001,
+    "interval_factor_fatigue_growth": 0.0005,
+    "fatigue_acceleration_factor": 0.5,
+    "base_tension": 700.0,
+    "interval_factor_tension": 100.0,
+    "min_interval_multiplier": 0.5,
+    "max_interval_multiplier": 2.0,
+    "tension_history_size": 100
+  },
+  "exploration": {
+    "epsilon_greedy": true,
+    "softmax_temperature": 1.0,
+    "noisy_nets": false,
+    "parameter_space_noise": false
+  },
+  "logging": {
+    "log_interval": 10,
+    "save_model_interval": 100,
+    "tensorboard_logging": false,
+    "metrics_export_interval": 50
+  }
+}

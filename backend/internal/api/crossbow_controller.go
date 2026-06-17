@@ -5,12 +5,10 @@ import (
 	"strconv"
 	"time"
 
+	"crossbow-simulation/backend/internal/alarm_ws"
+	"crossbow-simulation/backend/internal/coordinator"
 	"crossbow-simulation/backend/internal/model"
 	"crossbow-simulation/backend/internal/repository"
-	"crossbow-simulation/backend/internal/simulation"
-	"crossbow-simulation/backend/internal/rl"
-	"crossbow-simulation/backend/internal/alert"
-	"crossbow-simulation/backend/internal/websocket"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -18,22 +16,15 @@ import (
 )
 
 type Controller struct {
-	repo        *repository.Repository
-	simService  *simulation.SimulationService
-	rlService    *rl.RLService
-	alertService *alert.AlertService
-	wsHub        *websocket.Hub
-	upgrader     websocket.Upgrader
+	repo     *repository.Repository
+	coord    *coordinator.Coordinator
+	upgrader websocket.Upgrader
 }
 
-func NewController(repo *repository.Repository, simService *simulation.SimulationService,
-	rlService *rl.RLService, alertService *alert.AlertService, wsHub *websocket.Hub) *Controller {
+func NewController(repo *repository.Repository, coord *coordinator.Coordinator) *Controller {
 	return &Controller{
-		repo:        repo,
-		simService:  simService,
-		rlService:    rlService,
-		alertService: alertService,
-		wsHub:        wsHub,
+		repo:  repo,
+		coord: coord,
 		upgrader: websocket.Upgrader{
 			ReadBufferSize:  1024,
 			WriteBufferSize: 1024,
@@ -51,6 +42,12 @@ func (ctrl *Controller) HealthCheck(c *gin.Context) {
 		Data: map[string]interface{}{
 			"timestamp": time.Now().UTC().Format(time.RFC3339),
 			"status":    "healthy",
+			"system": map[string]interface{}{
+				"dtu_receiver":   ctrl.coord.GetDTUStats(),
+				"alarm_service":  ctrl.coord.GetAlarmStats(),
+				"websocket_clients": ctrl.coord.GetClientCount(),
+				"crossbow_instances": ctrl.coord.ListCrossbows(),
+			},
 		},
 	})
 }
@@ -68,13 +65,21 @@ func (ctrl *Controller) GetCrossbows(c *gin.Context) {
 		return
 	}
 
+	// 补充运行状态
+	for _, cb := range crossbows {
+		cb.Status = "idle"
+		if ctrl.coord.IsSimulatorRunning(cb.ID) {
+			cb.Status = "running"
+		}
+	}
+
 	c.JSON(http.StatusOK, model.APIResponse{
 		Success: true,
 		Data: map[string]interface{}{
-			"items": crossbows,
-			"total": total,
-			"page":  page,
-			"pageSize": pageSize,
+			"items":     crossbows,
+			"total":     total,
+			"page":      page,
+			"pageSize":  pageSize,
 		},
 	})
 }
@@ -90,9 +95,25 @@ func (ctrl *Controller) GetCrossbow(c *gin.Context) {
 		return
 	}
 
+	// 补充运行状态
+	crossbow.Status = "idle"
+	if ctrl.coord.IsSimulatorRunning(id) {
+		crossbow.Status = "running"
+	}
+
+	// 补充当前状态
+	simState := ctrl.coord.GetSimulatorState(id)
+	fatigueState := ctrl.coord.GetFatigueState(id)
+	rlStatus := ctrl.coord.GetRLStatus(id)
+
 	c.JSON(http.StatusOK, model.APIResponse{
 		Success: true,
-		Data:    crossbow,
+		Data: map[string]interface{}{
+			"crossbow": crossbow,
+			"simulation": simState,
+			"fatigue": fatigueState,
+			"rl": rlStatus,
+		},
 	})
 }
 
@@ -116,6 +137,14 @@ func (ctrl *Controller) CreateCrossbow(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, model.APIResponse{
 			Success: false,
 			Message: "Failed to create crossbow",
+		})
+		return
+	}
+
+	if err := ctrl.coord.CreateCrossbowInstance(id); err != nil {
+		c.JSON(http.StatusInternalServerError, model.APIResponse{
+			Success: false,
+			Message: "Failed to create simulation instance",
 		})
 		return
 	}
@@ -171,7 +200,7 @@ func (ctrl *Controller) StartSimulation(c *gin.Context) {
 		return
 	}
 
-	go ctrl.simService.Start(id, req.SimulationSpeed, req.EnableRL)
+	go ctrl.coord.StartSimulation(id, req.SimulationSpeed, req.EnableRL)
 
 	sessionID := uuid.New().String()
 	c.JSON(http.StatusOK, model.APIResponse{
@@ -185,7 +214,7 @@ func (ctrl *Controller) StartSimulation(c *gin.Context) {
 
 func (ctrl *Controller) StopSimulation(c *gin.Context) {
 	id := c.Param("id")
-	ctrl.simService.Stop(id)
+	ctrl.coord.StopSimulation(id)
 
 	if err := ctrl.repo.UpdateCrossbowStatus(id, "idle"); err != nil {
 		c.JSON(http.StatusInternalServerError, model.APIResponse{
@@ -203,7 +232,7 @@ func (ctrl *Controller) StopSimulation(c *gin.Context) {
 
 func (ctrl *Controller) ResetSimulation(c *gin.Context) {
 	id := c.Param("id")
-	ctrl.simService.Reset(id)
+	ctrl.coord.ResetSimulation(id)
 
 	if err := ctrl.repo.UpdateCrossbowStatus(id, "idle"); err != nil {
 		c.JSON(http.StatusInternalServerError, model.APIResponse{
@@ -233,16 +262,13 @@ func (ctrl *Controller) ReceiveSensorData(c *gin.Context) {
 		sensorData.Timestamp = time.Now()
 	}
 
-	if err := ctrl.repo.InsertSensorData(&sensorData); err != nil {
-		c.JSON(http.StatusInternalServerError, model.APIResponse{
+	if err := ctrl.coord.ReceiveSensorData(sensorData); err != nil {
+		c.JSON(http.StatusServiceUnavailable, model.APIResponse{
 			Success: false,
-			Message: "Failed to save sensor data",
+			Message: "Receiver is unavailable",
 		})
 		return
 	}
-
-	ctrl.wsHub.BroadcastSensorData(sensorData.CrossbowID, &sensorData)
-	ctrl.alertService.ProcessSensorData(sensorData.CrossbowID, &sensorData)
 
 	c.JSON(http.StatusOK, model.APIResponse{
 		Success: true,
@@ -286,35 +312,27 @@ func (ctrl *Controller) QueryData(c *gin.Context) {
 
 func (ctrl *Controller) GetAlerts(c *gin.Context) {
 	crossbowID := c.Query("crossbowId")
-	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
-	pageSize, _ := strconv.Atoi(c.DefaultQuery("pageSize", "20"))
+	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "100"))
 
-	alerts, total, err := ctrl.alertService.GetAlerts(crossbowID, page, pageSize)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, model.APIResponse{
-			Success: false,
-			Message: "Failed to get alerts",
-		})
-		return
-	}
+	alerts := ctrl.coord.GetAlerts(crossbowID, limit)
+	activeAlerts := ctrl.coord.GetActiveAlerts(crossbowID)
 
 	c.JSON(http.StatusOK, model.APIResponse{
 		Success: true,
 		Data: map[string]interface{}{
-			"items": alerts,
-			"total": total,
-			"page":  page,
-			"pageSize": pageSize,
+			"items":         alerts,
+			"active_alerts": activeAlerts,
+			"total":         len(alerts),
 		},
 	})
 }
 
 func (ctrl *Controller) AcknowledgeAlert(c *gin.Context) {
 	id := c.Param("id")
-	if err := ctrl.alertService.AcknowledgeAlert(id); err != nil {
-		c.JSON(http.StatusInternalServerError, model.APIResponse{
+	if ok := ctrl.coord.ResolveAlert(id); !ok {
+		c.JSON(http.StatusNotFound, model.APIResponse{
 			Success: false,
-			Message: "Failed to acknowledge alert",
+			Message: "Alert not found",
 		})
 		return
 	}
@@ -325,51 +343,18 @@ func (ctrl *Controller) AcknowledgeAlert(c *gin.Context) {
 	})
 }
 
-func (ctrl *Controller) GetAlertThresholds(c *gin.Context) {
-	crossbowID := c.Param("id")
-	thresholds, err := ctrl.alertService.GetThresholds(crossbowID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, model.APIResponse{
-			Success: false,
-			Message: "Failed to get thresholds",
-		})
-		return
-	}
-
-	c.JSON(http.StatusOK, model.APIResponse{
-		Success: true,
-		Data:    thresholds,
-	})
-}
-
-func (ctrl *Controller) UpdateAlertThresholds(c *gin.Context) {
-	var thresholds model.AlertThresholds
-	if err := c.ShouldBindJSON(&thresholds); err != nil {
-		c.JSON(http.StatusBadRequest, model.APIResponse{
-			Success: false,
-			Message: "Invalid thresholds data",
-		})
-		return
-	}
-
-	thresholds.UpdatedAt = time.Now()
-	if err := ctrl.alertService.UpdateThresholds(&thresholds); err != nil {
-		c.JSON(http.StatusInternalServerError, model.APIResponse{
-			Success: false,
-			Message: "Failed to update thresholds",
-		})
-		return
-	}
-
-	c.JSON(http.StatusOK, model.APIResponse{
-		Success: true,
-		Data:    thresholds,
-	})
-}
-
 func (ctrl *Controller) StartRLTraining(c *gin.Context) {
 	id := c.Param("id")
-	ctrl.rlService.StartTraining(id, 1000)
+
+	var req struct {
+		MagazineCapacity int `json:"magazineCapacity"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		req.MagazineCapacity = 10
+	}
+
+	ctrl.coord.StartRLTraining(id, req.MagazineCapacity)
+
 	c.JSON(http.StatusOK, model.APIResponse{
 		Success: true,
 		Message: "RL training started",
@@ -378,7 +363,16 @@ func (ctrl *Controller) StartRLTraining(c *gin.Context) {
 
 func (ctrl *Controller) GetRLStatus(c *gin.Context) {
 	id := c.Param("id")
-	status := ctrl.rlService.GetStatus()
+	status := ctrl.coord.GetRLStatus(id)
+
+	if status == nil {
+		c.JSON(http.StatusNotFound, model.APIResponse{
+			Success: false,
+			Message: "RL status not available",
+		})
+		return
+	}
+
 	c.JSON(http.StatusOK, model.APIResponse{
 		Success: true,
 		Data:    status,
@@ -387,11 +381,12 @@ func (ctrl *Controller) GetRLStatus(c *gin.Context) {
 
 func (ctrl *Controller) GetRLResult(c *gin.Context) {
 	id := c.Param("id")
-	result, err := ctrl.rlService.GetOptimizedPolicy()
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, model.APIResponse{
+	result := ctrl.coord.GetOptimizedPolicy(id)
+
+	if result == nil {
+		c.JSON(http.StatusNotFound, model.APIResponse{
 			Success: false,
-			Message: err.Error(),
+			Message: "Optimized policy not available",
 		})
 		return
 	}
@@ -403,7 +398,8 @@ func (ctrl *Controller) GetRLResult(c *gin.Context) {
 }
 
 func (ctrl *Controller) PauseRLTraining(c *gin.Context) {
-	ctrl.rlService.PauseTraining()
+	id := c.Param("id")
+	ctrl.coord.PauseRLTraining(id)
 	c.JSON(http.StatusOK, model.APIResponse{
 		Success: true,
 		Message: "RL training paused",
@@ -411,7 +407,8 @@ func (ctrl *Controller) PauseRLTraining(c *gin.Context) {
 }
 
 func (ctrl *Controller) ResumeRLTraining(c *gin.Context) {
-	ctrl.rlService.ResumeTraining()
+	id := c.Param("id")
+	ctrl.coord.ResumeRLTraining(id)
 	c.JSON(http.StatusOK, model.APIResponse{
 		Success: true,
 		Message: "RL training resumed",
@@ -425,14 +422,26 @@ func (ctrl *Controller) WebSocketHandler(c *gin.Context) {
 		return
 	}
 
-	client := &websocket.Client{
+	client := &alarm_ws.Client{
 		Conn:       conn,
 		Send:       make(chan []byte, 256),
 		CrossbowID: crossbowID,
 	}
 
-	ctrl.wsHub.Register <- client
+	ctrl.coord.RegisterWebSocketClient(client)
 
-	go client.WritePump(ctrl.wsHub)
-	go client.ReadPump(ctrl.wsHub)
+	go ctrl.coord.WritePump(client)
+	go ctrl.coord.ReadPump(client)
+}
+
+func (ctrl *Controller) GetSystemStats(c *gin.Context) {
+	c.JSON(http.StatusOK, model.APIResponse{
+		Success: true,
+		Data: map[string]interface{}{
+			"dtu_receiver":      ctrl.coord.GetDTUStats(),
+			"alarm_service":     ctrl.coord.GetAlarmStats(),
+			"websocket_clients": ctrl.coord.GetClientCount(),
+			"crossbow_instances": ctrl.coord.ListCrossbows(),
+		},
+	})
 }

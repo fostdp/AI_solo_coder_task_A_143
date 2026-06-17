@@ -12,12 +12,9 @@ import (
 
 	"crossbow-simulation/backend/config"
 	"crossbow-simulation/backend/internal/api"
-	"crossbow-simulation/backend/internal/alert"
+	"crossbow-simulation/backend/internal/coordinator"
 	"crossbow-simulation/backend/internal/model"
 	"crossbow-simulation/backend/internal/repository"
-	"crossbow-simulation/backend/internal/rl"
-	"crossbow-simulation/backend/internal/simulation"
-	"crossbow-simulation/backend/internal/websocket"
 
 	"github.com/gin-gonic/gin"
 )
@@ -36,15 +33,13 @@ func main() {
 
 	repo := repository.NewRepository(repository.GetDB())
 
-	wsHub := websocket.NewHub()
-	go wsHub.Run()
-
-	rlConfig := rl.DefaultTrainingConfig()
-	rlService := rl.NewRLService(rlConfig)
-
-	alertService := alert.NewAlertService(repo, wsHub)
-	alertService.Start()
-	defer alertService.Stop()
+	coord := coordinator.NewCoordinator(
+		config.MechParams,
+		config.RLConfig,
+		repo,
+	)
+	coord.Start()
+	defer coord.Stop()
 
 	crossbowList, _, err := repo.ListCrossbows(1, 1)
 	if err != nil {
@@ -76,16 +71,11 @@ func main() {
 		log.Printf("Using existing crossbow: %s (ID: %s)", crossbowList[0].Name, crossbowID)
 	}
 
-	simConfig := simulation.DefaultConfig()
-	simConfig.TimeStep = config.AppConfig.Simulation.TimeStep
-	simConfig.SpeedMultiplier = config.AppConfig.Simulation.SpeedMultiplier
-
-	simService, err := simulation.NewSimulationService(simConfig, defaultConfig, repo, wsHub, rlService, alertService)
-	if err != nil {
-		log.Fatalf("Failed to create simulation service: %v", err)
+	if err := coord.CreateCrossbowInstance(crossbowID); err != nil {
+		log.Printf("Warning: Failed to create crossbow instance: %v", err)
 	}
 
-	ctrl := api.NewController(repo, simService, rlService, alertService, wsHub)
+	ctrl := api.NewController(repo, coord)
 
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.Default()
@@ -112,7 +102,7 @@ func main() {
 	<-quit
 	log.Println("Shutting down server...")
 
-	simService.Stop(crossbowID)
+	coord.StopSimulation(crossbowID)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
