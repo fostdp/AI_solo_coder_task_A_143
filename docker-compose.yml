@@ -1,70 +1,285 @@
 version: '3.8'
 
 services:
+  # ============================================================
+  # 时序数据库 - TimescaleDB (PostgreSQL + TimescaleDB 扩展)
+  # ============================================================
   timescale:
     image: timescale/timescaledb:2.13.0-pg16
     container_name: crossbow-timescale
+    restart: unless-stopped
     environment:
-      POSTGRES_DB: crossbow_db
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: ${POSTGRES_DB:-crossbow_db}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      TIMESCALEDB_TELEMETRY: "off"
+      TZ: Asia/Shanghai
     ports:
-      - "5432:5432"
+      - "${POSTGRES_PORT:-5432}:5432"
     volumes:
       - timescale-data:/var/lib/postgresql/data
-      - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql
+      - ./database/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    command:
+      - "postgres"
+      - "-c"
+      - "shared_preload_libraries=timescaledb"
+      - "-c"
+      - "max_connections=200"
+      - "-c"
+      - "shared_buffers=256MB"
+      - "-c"
+      - "work_mem=4MB"
+      - "-c"
+      - "maintenance_work_mem=64MB"
+      - "-c"
+      - "effective_cache_size=1GB"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+        test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
+        interval: 10s
+        timeout: 5s
+        retries: 10
+        start_period: 30s
+    networks:
+      - crossbow-net
 
-  redis:
-    image: redis:7-alpine
-    container_name: crossbow-redis
+  # ============================================================
+  # MQTT Broker - Eclipse Mosquitto
+  # ============================================================
+  mosquitto:
+    image: eclipse-mosquitto:2.0.18
+    container_name: crossbow-mosquitto
+    restart: unless-stopped
+    environment:
+      TZ: Asia/Shanghai
     ports:
-      - "6379:6379"
+      - "${MQTT_PORT:-1883}:1883"
+      - "${MQTT_WS_PORT:-9001}:9001"
     volumes:
-      - redis-data:/data
+      - ./mqtt/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - mosquitto-data:/mosquitto/data
+      - mosquitto-log:/mosquitto/log
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
+      test: ["CMD-SHELL", "mosquitto_sub -h localhost -p 1883 -t $$SYS/broker/uptime -C 1 -W 3 || exit 1"]
+      interval: 30s
       timeout: 5s
       retries: 5
+    networks:
+      - crossbow-net
 
+  # ============================================================
+  # Go 后端服务
+  # ============================================================
   backend:
     build:
       context: ./backend
       dockerfile: Dockerfile
     container_name: crossbow-backend
-    ports:
-      - "8080:8080"
+    restart: unless-stopped
     environment:
-      - DATABASE_HOST=timescale
-      - DATABASE_PORT=5432
-      - DATABASE_USER=postgres
-      - DATABASE_PASSWORD=postgres
-      - DATABASE_DBNAME=crossbow_db
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
+      TZ: Asia/Shanghai
+      DATABASE_HOST: timescale
+      DATABASE_PORT: 5432
+      DATABASE_USER: ${POSTGRES_USER:-postgres}
+      DATABASE_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      DATABASE_DBNAME: ${POSTGRES_DB:-crossbow_db}
+      DATABASE_SSLMODE: disable
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      SERVER_HOST: 0.0.0.0
+      SERVER_PORT: 8080
+      GIN_MODE: release
+    ports:
+      - "${BACKEND_PORT:-8080}:8080"
+      - "${PPROF_PORT:-6060}:6060"
     depends_on:
       timescale:
         condition: service_healthy
-      redis:
-        condition: service_healthy
     volumes:
-      - ./backend/config:/app/config
+      - ./backend/config:/app/config:ro
+    networks:
+      - crossbow-net
 
+  # ============================================================
+  # 前端 Web UI (React + Vite + Nginx)
+  # ============================================================
   frontend:
     build:
       context: ./frontend
       dockerfile: Dockerfile
     container_name: crossbow-frontend
+    restart: unless-stopped
+    environment:
+      TZ: Asia/Shanghai
     ports:
-      - "3000:80"
+      - "${FRONTEND_PORT:-3000}:80"
     depends_on:
       - backend
+    networks:
+      - crossbow-net
+
+  # ============================================================
+  # Prometheus 指标采集
+  # ============================================================
+  prometheus:
+    image: prom/prometheus:v2.51.2
+    container_name: crossbow-prometheus
+    restart: unless-stopped
+    environment:
+      TZ: Asia/Shanghai
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=30d'
+      - '--storage.tsdb.retention.size=10GB'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+      - '--web.enable-lifecycle'
+    ports:
+      - "${PROM_PORT:-9090}:9090"
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/prometheus/rules:/etc/prometheus/rules:ro
+      - prometheus-data:/prometheus
+    depends_on:
+      - backend
+    networks:
+      - crossbow-net
+
+  # ============================================================
+  # Grafana 可视化面板
+  # ============================================================
+  grafana:
+    image: grafana/grafana:10.4.2
+    container_name: crossbow-grafana
+    restart: unless-stopped
+    environment:
+      TZ: Asia/Shanghai
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_INSTALL_PLUGINS: "grafana-clock-panel,grafana-simple-json-datasource"
+    ports:
+      - "${GRAFANA_PORT:-3001}:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+      - timescale
+    networks:
+      - crossbow-net
+
+  # ============================================================
+  # 连弩传感器模拟器
+  # ============================================================
+  sensor-simulator:
+    build:
+      context: ./sensor-simulator
+      dockerfile: Dockerfile
+    container_name: crossbow-sensor-simulator
+    restart: unless-stopped
+    environment:
+      TZ: Asia/Shanghai
+    command:
+      - "--crossbow-id"
+      - "${SIM_CROSSBOW_ID:-crossbow-001}"
+      - "--backend-url"
+      - "http://backend:8080/api/v1/sensor/data"
+      - "--mode"
+      - "${SIM_MODE:-normal}"
+      - "--report-interval"
+      - "${SIM_INTERVAL:-1}"
+      - "--magazine-size"
+      - "${SIM_MAGAZINE_SIZE:-10}"
+      - "--initial-fatigue"
+      - "${SIM_INITIAL_FATIGUE:-0}"
+    volumes:
+      - ./sensor-simulator/config.yaml:/app/config.yaml:ro
+      - ./sensor-simulator/logs:/app/logs
+    depends_on:
+      - backend
+      - mosquitto
+    networks:
+      - crossbow-net
+    profiles:
+      - simulator
+
+  # ============================================================
+  # 第二台模拟器 (不同参数)
+  # ============================================================
+  sensor-simulator-2:
+    build:
+      context: ./sensor-simulator
+      dockerfile: Dockerfile
+    container_name: crossbow-sensor-sim-2
+    restart: unless-stopped
+    environment:
+      TZ: Asia/Shanghai
+    command:
+      - "--crossbow-id"
+      - "crossbow-002"
+      - "--backend-url"
+      - "http://backend:8080/api/v1/sensor/data"
+      - "--mode"
+      - "${SIM2_MODE:-fatigue}"
+      - "--report-interval"
+      - "${SIM2_INTERVAL:-2}"
+      - "--magazine-size"
+      - "${SIM2_MAGAZINE_SIZE:-6}"
+      - "--initial-fatigue"
+      - "0.3"
+      - "--jam-after"
+      - "500"
+      - "--disable-mqtt"
+    volumes:
+      - ./sensor-simulator/config.yaml:/app/config.yaml:ro
+      - ./sensor-simulator/logs:/app/logs
+    depends_on:
+      - backend
+    networks:
+      - crossbow-net
+    profiles:
+      - simulator2
+
+  # ============================================================
+  # Redis 缓存
+  # ============================================================
+  redis:
+    image: redis:7-alpine
+    container_name: crossbow-redis
+    restart: unless-stopped
+    environment:
+      TZ: Asia/Shanghai
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis-data:/data
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - crossbow-net
 
 volumes:
   timescale-data:
+    driver: local
   redis-data:
+    driver: local
+  mosquitto-data:
+    driver: local
+  mosquitto-log:
+    driver: local
+  prometheus-data:
+    driver: local
+  grafana-data:
+    driver: local
+
+networks:
+  crossbow-net:
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.28.0.0/16

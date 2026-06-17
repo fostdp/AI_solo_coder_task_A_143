@@ -1,0 +1,57 @@
+groups:
+  - name: crossbow_alerts
+    interval: 30s
+    rules:
+      - alert: CrossbowServiceDown
+        expr: up{job="crossbow-backend"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "连弩后端服务宕机"
+          description: "{{ $labels.instance }} 连弩后端服务已宕机超过1分钟"
+
+      - alert: HighStringTension
+        expr: crossbow_string_tension_newtons > 1150
+        for: 30s
+        labels:
+          severity: warning
+        annotations:
+          summary: "弓弦张力过高"
+          description: "连弩 {{ $labels.crossbow_id }} 弓弦张力 {{ $value }}N 超过安全阈值1150N"
+
+      - alert: HighFatigue
+        expr: crossbow_string_fatigue_ratio > 0.8
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "弓弦疲劳度高"
+          description: "连弩 {{ $labels.crossbow_id }} 疲劳度 {{ $value | humanizePercentage }}，建议更换弓弦"
+
+      - alert: CriticalFatigue
+        expr: crossbow_string_fatigue_ratio > 0.9
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "弓弦即将断裂"
+          description: "连弩 {{ $labels.crossbow_id }} 疲劳度 {{ $value | humanizePercentage }}，立即停止使用！"
+
+      - alert: CriticalAlertGenerated
+        expr: increase(crossbow_alerts_total{level="critical"}[5m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "产生严重告警"
+          description: "连弩 {{ $labels.crossbow_id }} 产生严重级别告警，请立即处理"
+
+      - alert: RLTakingTooLong
+        expr: increase(crossbow_rl_episodes_total[10m]) < 5 and crossbow_rl_training_active == 1
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "强化学习训练停滞"
+          description: "连弩 {{ $labels.crossbow_id }} RL训练进度过慢，15分钟内少于5个episode"

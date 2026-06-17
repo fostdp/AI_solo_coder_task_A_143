@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"crossbow-simulation/backend/config"
+	"crossbow-simulation/backend/internal/middleware"
 	"crossbow-simulation/backend/internal/model"
 
 	"github.com/gorilla/websocket"
@@ -466,6 +467,9 @@ func (a *AlarmWS) checkDeformation(crossbowID string, deformation float64) *Aler
 // triggerAlert 触发告警（保存+推送）
 func (a *AlarmWS) triggerAlert(alert *Alert) {
 	a.alertCount++
+
+	// Prometheus指标
+	middleware.IncrementAlert(alert.CrossbowID, string(alert.Level))
 
 	// 保存到历史
 	if _, ok := a.alerts[alert.CrossbowID]; !ok {

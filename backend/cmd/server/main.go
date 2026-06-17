@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"syscall"
@@ -13,10 +14,12 @@ import (
 	"crossbow-simulation/backend/config"
 	"crossbow-simulation/backend/internal/api"
 	"crossbow-simulation/backend/internal/coordinator"
+	"crossbow-simulation/backend/internal/middleware"
 	"crossbow-simulation/backend/internal/model"
 	"crossbow-simulation/backend/internal/repository"
 
 	"github.com/gin-gonic/gin"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 func main() {
@@ -80,7 +83,19 @@ func main() {
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.Default()
 
+	r.Use(middleware.PrometheusMetrics())
+
 	api.SetupRoutes(r, ctrl)
+
+	r.GET("/metrics", gin.WrapH(promhttp.Handler()))
+
+	go func() {
+		pprofAddr := "0.0.0.0:6060"
+		log.Printf("pprof debug server starting on %s", pprofAddr)
+		if err := http.ListenAndServe(pprofAddr, nil); err != nil && err != http.ErrServerClosed {
+			log.Printf("pprof server error: %v", err)
+		}
+	}()
 
 	addr := fmt.Sprintf("%s:%d", config.AppConfig.Server.Host, config.AppConfig.Server.Port)
 	srv := &http.Server{
@@ -92,6 +107,8 @@ func main() {
 
 	go func() {
 		log.Printf("Server starting on %s", addr)
+		log.Printf("Metrics endpoint: http://%s/metrics", addr)
+		log.Printf("pprof endpoint: http://localhost:6060/debug/pprof/")
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("Failed to start server: %v", err)
 		}

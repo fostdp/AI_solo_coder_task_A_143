@@ -11,6 +11,7 @@ import (
 	"crossbow-simulation/backend/internal/dtu_receiver"
 	"crossbow-simulation/backend/internal/fire_rate_optimizer"
 	"crossbow-simulation/backend/internal/mechanism_simulator"
+	"crossbow-simulation/backend/internal/middleware"
 	"crossbow-simulation/backend/internal/model"
 	"crossbow-simulation/backend/internal/repository"
 	"crossbow-simulation/backend/internal/simulation"
@@ -186,6 +187,13 @@ func (c *Coordinator) handleValidatedData(validated dtu_receiver.ValidatedData) 
 	data := validated.Data
 	crossbowID := data.CrossbowID
 
+	// 0. Prometheus指标采集
+	middleware.IncrementSensorData(crossbowID)
+	middleware.SetFireRate(crossbowID, data.FireRate)
+	middleware.SetStringTension(crossbowID, data.StringTension)
+	middleware.SetStringFatigue(crossbowID, data.StringFatigue)
+	middleware.SetBowArmDeformation(crossbowID, data.BowArmDeformation)
+
 	// 1. 持久化到数据库
 	if err := c.repo.InsertSensorData(data); err != nil {
 		log.Printf("[Coordinator] Failed to persist sensor data: %v", err)
@@ -292,6 +300,7 @@ func (c *Coordinator) CreateCrossbowInstance(crossbowID string) error {
 	go c.handleOptimizerOutput(crossbowID, optOutputChan, simCmdChan)
 
 	log.Printf("[Coordinator] Created crossbow instance: %s", crossbowID)
+	middleware.SetSimulationsRunning(len(c.instances))
 	return nil
 }
 
