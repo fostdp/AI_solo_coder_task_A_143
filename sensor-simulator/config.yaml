@@ -1,0 +1,43 @@
+backend_url: "http://localhost:8080/api/v1/sensor/data"
+report_interval: 60
+crossbow_id: "crossbow-001"
+noise_level: 0.02
+
+physical_params:
+  string_stiffness: 3500.0
+  initial_tension: 450.0
+  bow_arm_length: 0.45
+  elastic_modulus: 70.0e9
+  moment_of_inertia: 1.5e-8
+  energy_efficiency: 0.65
+  arrow_mass: 0.025
+  reload_time: 5.5
+  fire_delay: 0.3
+  magazine_size: 10
+
+normal_ranges:
+  string_tension:
+    min: 700.0
+    max: 1100.0
+    idle: 450.0
+  bow_arm_deformation:
+    min: 5.0
+    max: 18.0
+  magazine_position:
+    min: 0.0
+    max: 1.0
+  fire_rate:
+    min: 8.5
+    max: 11.5
+  arrow_velocity:
+    min: 55.0
+    max: 85.0
+  cam_angle:
+    min: 0.0
+    max: 360.0
+  string_fatigue:
+    min: 0.0
+    max: 1.0
+  temperature:
+    min: 20.0
+    max: 30.0
